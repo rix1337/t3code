@@ -342,6 +342,7 @@ export const makeOrchestrationIntegrationHarness = (
           tryHandlePromptCommand: () => Effect.succeed(false),
         }),
       ),
+      Layer.provide(OrchestrationEventStoreLive),
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(gitWorkflowLayer),
       Layer.provideMerge(textGenerationLayer),

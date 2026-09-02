@@ -14,6 +14,7 @@ import {
   TurnId,
   type OrchestrationCheckpointSummary,
   type OrchestrationThreadActivity,
+  ProviderDriverKind,
   type ProviderRuntimeEvent,
   RuntimeRequestId,
 } from "@t3tools/contracts";
@@ -52,6 +53,7 @@ import { projectActivityPayload } from "../ActivityPayloadProjection.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { canReplaceThreadTitle } from "../threadTitles.ts";
+import { nextUsageLimitRetryAt } from "../../provider/usageLimits.ts";
 
 const providerTurnKey = (threadId: ThreadId, turnId: TurnId) => `${threadId}:${turnId}`;
 const providerTaskKey = (threadId: ThreadId, taskId: string) => `${threadId}:${taskId}`;
@@ -426,9 +428,14 @@ export function runtimeEventToActivities(
           createdAt: event.createdAt,
           tone: "error",
           kind: "runtime.error",
-          summary: "Runtime error",
+          summary:
+            event.payload.class === "usage_limit"
+              ? "Provider usage limit or temporary unavailability"
+              : "Runtime error",
           payload: {
             message: truncateDetail(event.payload.message),
+            ...(event.payload.class !== undefined ? { class: event.payload.class } : {}),
+            ...(event.payload.retryAt !== undefined ? { retryAt: event.payload.retryAt } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -1605,6 +1612,9 @@ const make = Effect.gen(function* () {
               : status === "ready" || status === "interrupted"
                 ? null
                 : (thread.session?.lastError ?? null);
+        const preservesErrorMetadata =
+          event.type === "turn.completed" &&
+          normalizeRuntimeTurnState(event.payload.state) === "failed";
 
         if (shouldApplyThreadLifecycle) {
           if (event.type === "turn.started" && acceptedTurnStartedSourcePlan !== null) {
@@ -1641,6 +1651,12 @@ const make = Effect.gen(function* () {
               runtimeMode: thread.session?.runtimeMode ?? "full-access",
               activeTurnId: nextActiveTurnId,
               lastError,
+              ...(preservesErrorMetadata && thread.session?.lastErrorClass !== undefined
+                ? { lastErrorClass: thread.session.lastErrorClass }
+                : {}),
+              ...(preservesErrorMetadata && thread.session?.retryAt !== undefined
+                ? { retryAt: thread.session.retryAt }
+                : {}),
               updatedAt: now,
             },
             createdAt: now,
@@ -1936,9 +1952,73 @@ const make = Effect.gen(function* () {
               runtimeMode: thread.session?.runtimeMode ?? "full-access",
               activeTurnId: eventTurnId ?? null,
               lastError: runtimeErrorMessage,
+              ...(event.payload.class !== undefined ? { lastErrorClass: event.payload.class } : {}),
+              ...(event.payload.retryAt !== undefined ? { retryAt: event.payload.retryAt } : {}),
               updatedAt: now,
             },
             createdAt: now,
+          });
+        }
+
+        if (
+          shouldApplyRuntimeError &&
+          event.payload.class === "usage_limit" &&
+          (yield* serverSettingsService.getSettings).enableAutomaticResume
+        ) {
+          const usageLimitResume = thread.usageLimitResume;
+          const resumeAt = nextUsageLimitRetryAt({
+            now,
+            attempt: usageLimitResume == null ? 0 : usageLimitResume.attempt + 1,
+            ...(event.payload.retryAt !== undefined
+              ? { providerRetryAt: event.payload.retryAt }
+              : {}),
+          });
+          if (usageLimitResume == null) {
+            yield* orchestrationEngine.dispatch({
+              type: "thread.usage-limit-resume.schedule",
+              commandId: yield* providerCommandId(event, "usage-limit-resume-schedule"),
+              threadId: thread.id,
+              resumeAt,
+            });
+          } else if (usageLimitResume.nextAttemptAt === null) {
+            yield* orchestrationEngine.dispatch({
+              type: "thread.usage-limit-resume.retry",
+              commandId: yield* providerCommandId(event, "usage-limit-resume-retry"),
+              ...(usageLimitResume.pendingMessageId !== undefined
+                ? { pendingMessageId: usageLimitResume.pendingMessageId }
+                : {}),
+              threadId: thread.id,
+              resumeAt,
+              attempt: usageLimitResume.attempt,
+              createdAt: now,
+            });
+          }
+        } else if (shouldApplyRuntimeError && thread.usageLimitResume?.nextAttemptAt === null) {
+          yield* orchestrationEngine.dispatch({
+            type: "thread.usage-limit-resume.cancel",
+            commandId: yield* providerCommandId(event, "usage-limit-resume-cancel"),
+            threadId: thread.id,
+          });
+        }
+      }
+
+      if (
+        shouldApplyThreadLifecycle &&
+        event.type === "turn.completed" &&
+        thread.usageLimitResume != null
+      ) {
+        const completedState = normalizeRuntimeTurnState(event.payload.state);
+        const resumeIsInFlight = thread.usageLimitResume.nextAttemptAt === null;
+        // OpenCode reports a trailing runtime error; Grok rejects sendTurn for reactor handling.
+        const awaitsFailureHandling =
+          completedState === "failed" &&
+          (event.provider === ProviderDriverKind.make("opencode") ||
+            event.provider === ProviderDriverKind.make("grok"));
+        if (resumeIsInFlight && !awaitsFailureHandling) {
+          yield* orchestrationEngine.dispatch({
+            type: "thread.usage-limit-resume.cancel",
+            commandId: yield* providerCommandId(event, "usage-limit-resume-completed"),
+            threadId: thread.id,
           });
         }
       }
@@ -2126,7 +2206,12 @@ const make = Effect.gen(function* () {
         }
       }
 
-      const activities = runtimeEventToActivities(activityEvent, taskTitle);
+      const activities =
+        event.type === "runtime.error" &&
+        event.payload.class === "usage_limit" &&
+        thread.usageLimitResume != null
+          ? []
+          : runtimeEventToActivities(activityEvent, taskTitle);
       yield* Effect.forEach(activities, (activity) =>
         providerCommandId(event, "thread-activity-append").pipe(
           Effect.flatMap((commandId) =>

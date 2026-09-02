@@ -33,6 +33,7 @@ export interface SettingsSearchItem {
   readonly localBackendManagementOnly?: boolean;
   readonly wslAvailableOnly?: boolean;
   readonly requiresThreadAutoSettlement?: boolean;
+  readonly requiresThreadUsageLimitResume?: boolean;
 }
 
 export interface SettingsSearchAvailability {
@@ -42,6 +43,7 @@ export interface SettingsSearchAvailability {
   readonly canManageLocalBackend: boolean;
   readonly isWslSettingsRowVisible: boolean;
   readonly hasThreadAutoSettlement: boolean;
+  readonly hasThreadUsageLimitResume: boolean;
 }
 
 /**
@@ -391,6 +393,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     providerSettingsOnly: true,
   },
   {
+    id: "automatic-resume",
+    title: "Resume when available",
+    to: "/settings/integrations",
+    searchTerms: ["automatic retry usage limit capacity outage waiting opt out"],
+    requiresThreadUsageLimitResume: true,
+  },
+  {
     id: "agent-browser-access",
     title: "Agent browser access",
     to: "/settings/projects",
@@ -597,7 +606,8 @@ export function filterAvailableSettingsSearchItems(
       (!item.providerSettingsOnly || availability.hasProviderSettingsEnvironment) &&
       (!item.localBackendManagementOnly || availability.canManageLocalBackend) &&
       (!item.wslAvailableOnly || availability.isWslSettingsRowVisible) &&
-      (!item.requiresThreadAutoSettlement || availability.hasThreadAutoSettlement),
+      (!item.requiresThreadAutoSettlement || availability.hasThreadAutoSettlement) &&
+      (!item.requiresThreadUsageLimitResume || availability.hasThreadUsageLimitResume),
   );
 }
 

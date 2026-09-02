@@ -77,6 +77,11 @@ import {
   codexUsageLimitMessage,
   mergeCodexRateLimits,
 } from "./codexUsageLimits.ts";
+import {
+  providerUsageLimitFromError,
+  retryAtFromEpochSeconds,
+  type ProviderUsageLimit,
+} from "../usageLimits.ts";
 const isCodexAppServerProcessExitedError = Schema.is(CodexErrors.CodexAppServerProcessExitedError);
 const isCodexAppServerTransportError = Schema.is(CodexErrors.CodexAppServerTransportError);
 const isCodexSessionRuntimeThreadIdMissingError = Schema.is(
@@ -131,6 +136,34 @@ interface CodexTurnTokenUsageState {
   baseline: CodexCumulativeTokenUsage | undefined;
   activeTurnId: string | undefined;
   readonly byTurnId: Map<string, CodexTurnTokenUsageAccumulator>;
+}
+interface CodexUsageLimitState {
+  latest: ProviderUsageLimit | undefined;
+  activeTurn: (ProviderUsageLimit & { readonly turnId: string }) | undefined;
+}
+
+function codexRateLimitResetAt(
+  snapshot: EffectCodexSchema.V2AccountRateLimitsUpdatedNotification__RateLimitSnapshot,
+) {
+  const exhaustedResetCandidates = [
+    (snapshot.primary?.usedPercent ?? 0) >= 100 ? snapshot.primary?.resetsAt : undefined,
+    (snapshot.secondary?.usedPercent ?? 0) >= 100 ? snapshot.secondary?.resetsAt : undefined,
+    snapshot.spendControlReached === true ||
+    (snapshot.individualLimit?.remainingPercent ?? 100) <= 0
+      ? snapshot.individualLimit?.resetsAt
+      : undefined,
+  ].filter((value): value is number => typeof value === "number");
+  const resetCandidates =
+    exhaustedResetCandidates.length > 0
+      ? exhaustedResetCandidates
+      : [
+          snapshot.primary?.resetsAt,
+          snapshot.secondary?.resetsAt,
+          snapshot.individualLimit?.resetsAt,
+        ].filter((value): value is number => typeof value === "number");
+  return resetCandidates.length === 0
+    ? undefined
+    : retryAtFromEpochSeconds(Math.max(...resetCandidates));
 }
 
 function mapCodexRuntimeError(
@@ -1300,6 +1333,7 @@ function mapCollabAgentEvent(
 function mapToRuntimeEvents(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
+  usageLimitState: CodexUsageLimitState,
 ): ReadonlyArray<ProviderRuntimeEvent> {
   if (event.kind === "notification" && event.method.startsWith("collabAgent/")) {
     return mapCollabAgentEvent(event, canonicalThreadId);
@@ -1308,13 +1342,18 @@ function mapToRuntimeEvents(
     if (!event.message) {
       return [];
     }
+    const usageLimit = providerUsageLimitFromError({
+      message: event.message,
+      detail: event.payload,
+    });
     return [
       {
         ...runtimeEventBase(event, canonicalThreadId),
         type: "runtime.error",
         payload: {
           message: event.message,
-          class: "provider_error",
+          class: usageLimit === null ? "provider_error" : "usage_limit",
+          ...(usageLimit?.retryAt !== undefined ? { retryAt: usageLimit.retryAt } : {}),
           ...(event.payload !== undefined ? { detail: event.payload } : {}),
         },
       },
@@ -1987,6 +2026,13 @@ function mapToRuntimeEvents(
       event.payload,
     );
     const limits = payload ? codexRateLimitsToUpdate(payload.rateLimits) : undefined;
+    if (!payload) {
+      return [];
+    }
+    const retryAt = codexRateLimitResetAt(payload.rateLimits);
+    if (retryAt !== undefined) {
+      usageLimitState.latest = { retryAt };
+    }
     if (!limits) {
       return [];
     }
@@ -2111,13 +2157,32 @@ function mapToRuntimeEvents(
     const payload = readPayload(EffectCodexSchema.V2ErrorNotification, event.payload);
     const message = payload?.error.message ?? event.message ?? "Provider runtime error";
     const willRetry = payload?.willRetry === true;
+    const parsedUsageLimit = providerUsageLimitFromError({
+      message,
+      detail: event.payload,
+      ...(payload?.error.codexErrorInfo === "usageLimitExceeded" &&
+      usageLimitState.latest?.retryAt !== undefined
+        ? { retryAt: usageLimitState.latest.retryAt }
+        : {}),
+    });
+    const usageLimit =
+      payload?.error.codexErrorInfo === "usageLimitExceeded"
+        ? (parsedUsageLimit ?? usageLimitState.latest ?? {})
+        : parsedUsageLimit;
     return [
       {
         type: willRetry ? "runtime.warning" : "runtime.error",
         ...runtimeEventBase(event, canonicalThreadId),
         payload: {
           message,
-          ...(!willRetry ? { class: "provider_error" as const } : {}),
+          ...(!willRetry
+            ? {
+                class: usageLimit === null ? ("provider_error" as const) : ("usage_limit" as const),
+              }
+            : {}),
+          ...(!willRetry && usageLimit?.retryAt !== undefined
+            ? { retryAt: usageLimit.retryAt }
+            : {}),
           ...(event.payload !== undefined ? { detail: event.payload } : {}),
         },
       },
@@ -2318,9 +2383,14 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // this a child of `startSession`, and Effect interrupts a fiber's
         // children when it completes, so the consumer died on return and every
         // runtime event the session emitted afterwards was dropped.
+        const usageLimitState: CodexUsageLimitState = {
+          latest: undefined,
+          activeTurn: undefined,
+        };
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
+            if (event.method === "turn/started") usageLimitState.activeTurn = undefined;
             if (event.method === "turn/started" && event.turnId) {
               if (turnTokenUsage.activeTurnId !== event.turnId) {
                 turnTokenUsage.byTurnId.clear();
@@ -2365,6 +2435,18 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               );
               // The failed `turn/completed` repeats this sentence and is answered
               // below; relaying both would show the limit twice.
+              if (
+                errorPayload?.error.codexErrorInfo === "usageLimitExceeded" &&
+                errorPayload.turnId
+              ) {
+                const parsedUsageLimit = providerUsageLimitFromError({
+                  message: errorPayload.error.message,
+                  detail: event.payload,
+                });
+                if (parsedUsageLimit !== null) {
+                  usageLimitState.activeTurn = { turnId: errorPayload.turnId, ...parsedUsageLimit };
+                }
+              }
               if (errorPayload?.error.codexErrorInfo === "usageLimitExceeded") return;
             }
 
@@ -2380,49 +2462,67 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
                   ? completedPayload.turn.error
                   : undefined;
               if (turnError?.codexErrorInfo === "usageLimitExceeded") {
+                const parsedUsageLimit = turnError.message
+                  ? providerUsageLimitFromError({
+                      message: turnError.message,
+                      detail: turnError,
+                    })
+                  : null;
+                const retryAt =
+                  parsedUsageLimit?.retryAt ??
+                  (usageLimitState.activeTurn?.turnId === completedPayload?.turn.id
+                    ? usageLimitState.activeTurn?.retryAt
+                    : undefined) ??
+                  usageLimitState.latest?.retryAt;
                 usageLimitMessage = codexUsageLimitMessage(rateLimits, event.createdAt);
                 usageLimitError = {
                   ...runtimeEventBase(event, event.threadId),
                   type: "runtime.error",
                   payload: {
                     message: usageLimitMessage,
-                    class: "provider_error",
+                    class: "usage_limit",
+                    ...(retryAt !== undefined ? { retryAt } : {}),
                     ...(turnError.message ? { detail: turnError.message } : {}),
                   },
                 };
               }
+              usageLimitState.activeTurn = undefined;
+            } else if (event.method === "turn/aborted") {
+              usageLimitState.activeTurn = undefined;
             }
 
-            const mappedEvents = mapToRuntimeEvents(event, event.threadId).map((runtimeEvent) => {
-              if (runtimeEvent.type === "turn.completed" && runtimeEvent.turnId) {
-                return {
-                  ...runtimeEvent,
-                  payload: {
-                    ...runtimeEvent.payload,
-                    ...(usageLimitMessage ? { errorMessage: usageLimitMessage } : {}),
-                    tokenUsage: completeCodexTurnTokenUsage(
-                      turnTokenUsage,
-                      String(runtimeEvent.turnId),
-                      runtimeEvent.payload.state === "completed",
-                    ),
-                  },
-                } satisfies ProviderRuntimeEvent;
-              }
-              if (runtimeEvent.type === "turn.aborted" && runtimeEvent.turnId) {
-                return {
-                  ...runtimeEvent,
-                  payload: {
-                    ...runtimeEvent.payload,
-                    tokenUsage: completeCodexTurnTokenUsage(
-                      turnTokenUsage,
-                      String(runtimeEvent.turnId),
-                      false,
-                    ),
-                  },
-                } satisfies ProviderRuntimeEvent;
-              }
-              return runtimeEvent;
-            });
+            const mappedEvents = mapToRuntimeEvents(event, event.threadId, usageLimitState).map(
+              (runtimeEvent) => {
+                if (runtimeEvent.type === "turn.completed" && runtimeEvent.turnId) {
+                  return {
+                    ...runtimeEvent,
+                    payload: {
+                      ...runtimeEvent.payload,
+                      ...(usageLimitMessage ? { errorMessage: usageLimitMessage } : {}),
+                      tokenUsage: completeCodexTurnTokenUsage(
+                        turnTokenUsage,
+                        String(runtimeEvent.turnId),
+                        runtimeEvent.payload.state === "completed",
+                      ),
+                    },
+                  } satisfies ProviderRuntimeEvent;
+                }
+                if (runtimeEvent.type === "turn.aborted" && runtimeEvent.turnId) {
+                  return {
+                    ...runtimeEvent,
+                    payload: {
+                      ...runtimeEvent.payload,
+                      tokenUsage: completeCodexTurnTokenUsage(
+                        turnTokenUsage,
+                        String(runtimeEvent.turnId),
+                        false,
+                      ),
+                    },
+                  } satisfies ProviderRuntimeEvent;
+                }
+                return runtimeEvent;
+              },
+            );
             const runtimeEvents = usageLimitError
               ? [usageLimitError, ...mappedEvents]
               : mappedEvents;

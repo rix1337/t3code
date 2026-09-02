@@ -520,6 +520,16 @@ export const OrchestrationSessionStatus = Schema.Literals([
 ]);
 export type OrchestrationSessionStatus = typeof OrchestrationSessionStatus.Type;
 
+export const OrchestrationRuntimeErrorClass = Schema.Literals([
+  "provider_error",
+  "usage_limit",
+  "transport_error",
+  "permission_error",
+  "validation_error",
+  "unknown",
+]);
+export type OrchestrationRuntimeErrorClass = typeof OrchestrationRuntimeErrorClass.Type;
+
 export const OrchestrationSession = Schema.Struct({
   threadId: ThreadId,
   status: OrchestrationSessionStatus,
@@ -528,6 +538,8 @@ export const OrchestrationSession = Schema.Struct({
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   activeTurnId: Schema.NullOr(TurnId),
   lastError: Schema.NullOr(TrimmedNonEmptyString),
+  lastErrorClass: Schema.optional(OrchestrationRuntimeErrorClass),
+  retryAt: Schema.optional(IsoDateTime),
   updatedAt: IsoDateTime,
 });
 export type OrchestrationSession = typeof OrchestrationSession.Type;
@@ -607,6 +619,13 @@ export const ThreadLinkedPullRequest = Schema.Struct({
 });
 export type ThreadLinkedPullRequest = typeof ThreadLinkedPullRequest.Type;
 
+export const ThreadUsageLimitResume = Schema.Struct({
+  pendingMessageId: Schema.optional(MessageId),
+  nextAttemptAt: Schema.NullOr(IsoDateTime),
+  attempt: NonNegativeInt,
+});
+export type ThreadUsageLimitResume = typeof ThreadUsageLimitResume.Type;
+
 export const OrchestrationThread = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
@@ -639,6 +658,9 @@ export const OrchestrationThread = Schema.Struct({
   // Optional so payloads from pre-snooze servers still decode.
   snoozedUntil: Schema.optional(Schema.NullOr(IsoDateTime)),
   snoozedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  // A server-owned deferred continuation. Optional keeps older servers and
+  // clients wire-compatible while the server persists and recovers timers.
+  usageLimitResume: Schema.optional(Schema.NullOr(ThreadUsageLimitResume)),
   // Active pinned threads render in the pinned block. Settled and snoozed
   // threads remain in their respective shelves even when pinned.
   // Optional so payloads from pre-pinning servers still decode.
@@ -714,6 +736,7 @@ export const OrchestrationThreadShell = Schema.Struct({
   unsettledAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   snoozedUntil: Schema.optional(Schema.NullOr(IsoDateTime)),
   snoozedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
+  usageLimitResume: Schema.optional(Schema.NullOr(ThreadUsageLimitResume)),
   pinnedAt: Schema.optional(Schema.NullOr(IsoDateTime)),
   pinOrderKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   activeOrderKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
@@ -997,6 +1020,20 @@ const ThreadUnsnoozeCommand = Schema.Struct({
   reason: Schema.Literal("user"),
 });
 
+const ThreadUsageLimitResumeScheduleCommand = Schema.Struct({
+  pendingMessageId: Schema.optional(MessageId),
+  type: Schema.Literal("thread.usage-limit-resume.schedule"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  resumeAt: IsoDateTime,
+});
+
+const ThreadUsageLimitResumeCancelCommand = Schema.Struct({
+  type: Schema.Literal("thread.usage-limit-resume.cancel"),
+  commandId: CommandId,
+  threadId: ThreadId,
+});
+
 const ThreadPinCommand = Schema.Struct({
   type: Schema.Literal("thread.pin"),
   commandId: CommandId,
@@ -1203,6 +1240,8 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadUnsettleCommand,
   ThreadSnoozeCommand,
   ThreadUnsnoozeCommand,
+  ThreadUsageLimitResumeScheduleCommand,
+  ThreadUsageLimitResumeCancelCommand,
   ThreadPinCommand,
   ThreadUnpinCommand,
   ThreadPinReorderCommand,
@@ -1233,6 +1272,8 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadUnsettleCommand,
   ThreadSnoozeCommand,
   ThreadUnsnoozeCommand,
+  ThreadUsageLimitResumeScheduleCommand,
+  ThreadUsageLimitResumeCancelCommand,
   ThreadPinCommand,
   ThreadUnpinCommand,
   ThreadPinReorderCommand,
@@ -1258,6 +1299,24 @@ const ThreadSessionSetCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const ThreadUsageLimitResumeAttemptCommand = Schema.Struct({
+  type: Schema.Literal("thread.usage-limit-resume.attempt"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  expectedAttemptAt: IsoDateTime,
+  createdAt: IsoDateTime,
+});
+
+const ThreadUsageLimitResumeRetryCommand = Schema.Struct({
+  pendingMessageId: Schema.optional(MessageId),
+  type: Schema.Literal("thread.usage-limit-resume.retry"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  resumeAt: IsoDateTime,
+  attempt: NonNegativeInt,
+  createdAt: IsoDateTime,
+});
+
 const ThreadMessageAssistantDeltaCommand = Schema.Struct({
   type: Schema.Literal("thread.message.assistant.delta"),
   commandId: CommandId,
@@ -1270,6 +1329,7 @@ const ThreadMessageAssistantDeltaCommand = Schema.Struct({
 
 const ThreadMessageAssistantCompleteCommand = Schema.Struct({
   type: Schema.Literal("thread.message.assistant.complete"),
+  text: Schema.optional(Schema.String),
   commandId: CommandId,
   threadId: ThreadId,
   messageId: MessageId,
@@ -1356,6 +1416,8 @@ const ThreadPullRequestSyncCommand = Schema.Struct({
 
 const InternalOrchestrationCommand = Schema.Union([
   ThreadAutoSettleCommand,
+  ThreadUsageLimitResumeAttemptCommand,
+  ThreadUsageLimitResumeRetryCommand,
   ThreadSessionSetCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,
@@ -1387,6 +1449,9 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.unsettled",
   "thread.snoozed",
   "thread.unsnoozed",
+  "thread.usage-limit-resume-scheduled",
+  "thread.usage-limit-resume-cancelled",
+  "thread.usage-limit-resume-attempted",
   "thread.pinned",
   "thread.unpinned",
   "thread.pin-reordered",
@@ -1502,6 +1567,27 @@ export const ThreadUnsnoozedPayload = Schema.Struct({
   // thread.unsettled's activity resets. Timer wakes emit no event: clients
   // derive them from snoozedUntil passing.
   reason: Schema.Literals(["user", "activity"]),
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadUsageLimitResumeScheduledPayload = Schema.Struct({
+  pendingMessageId: Schema.optional(MessageId),
+  threadId: ThreadId,
+  resumeAt: IsoDateTime,
+  attempt: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadUsageLimitResumeCancelledPayload = Schema.Struct({
+  threadId: ThreadId,
+  updatedAt: IsoDateTime,
+});
+
+export const ThreadUsageLimitResumeAttemptedPayload = Schema.Struct({
+  threadId: ThreadId,
+  expectedAttemptAt: IsoDateTime,
+  attempt: NonNegativeInt,
+  shouldResume: Schema.Boolean,
   updatedAt: IsoDateTime,
 });
 
@@ -1738,6 +1824,21 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.unsnoozed"),
     payload: ThreadUnsnoozedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.usage-limit-resume-scheduled"),
+    payload: ThreadUsageLimitResumeScheduledPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.usage-limit-resume-cancelled"),
+    payload: ThreadUsageLimitResumeCancelledPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.usage-limit-resume-attempted"),
+    payload: ThreadUsageLimitResumeAttemptedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

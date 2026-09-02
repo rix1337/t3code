@@ -133,6 +133,7 @@ import {
   timelineContentOverflowsViewport,
   type TimelineScrollMode,
 } from "./chat/timelineScrollAnchoring";
+import { snoozeWakeDescription } from "./Sidebar.snooze";
 import {
   buildPendingUserInputAnswers,
   derivePendingUserInputProgress,
@@ -1818,6 +1819,18 @@ export default function ChatView(props: ChatViewProps) {
   // session.lastError. Bump a tick so the banner hides immediately. Mirrors
   // the branch mismatch banner.
   const [, setThreadErrorBannerDismissTick] = useState(0);
+  const usageLimitResume = activeServerThread?.usageLimitResume ?? null;
+  const displayedThreadError = visibleThreadError;
+  const usageLimitActionDescription =
+    usageLimitResume?.nextAttemptAt === null
+      ? "Trying again now."
+      : usageLimitResume?.nextAttemptAt
+        ? `Automatic resume scheduled for ${snoozeWakeDescription(
+            usageLimitResume.nextAttemptAt,
+            new Date(),
+            timestampFormat,
+          )}.`
+        : undefined;
   const runtimeMode = composerRuntimeMode ?? activeThread?.runtimeMode ?? DEFAULT_RUNTIME_MODE;
   const isLocalDraftThread = !isServerThread && localDraftThread !== undefined;
   const canCheckoutPullRequestIntoThread = isLocalDraftThread;
@@ -3321,7 +3334,7 @@ export default function ChatView(props: ChatViewProps) {
   )
     ? activeProviderStatus
     : null;
-  const hasTimelineTopBanner = Boolean(visibleThreadError) || visibleProviderStatus !== null;
+  const hasTimelineTopBanner = Boolean(displayedThreadError) || visibleProviderStatus !== null;
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
   const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;
@@ -8199,6 +8212,7 @@ export default function ChatView(props: ChatViewProps) {
               />
               <ThreadErrorBanner
                 error={visibleThreadError}
+                actionDescription={usageLimitActionDescription}
                 onDismiss={() => {
                   setThreadError(activeThread.id, null);
                   dismissThreadErrorBannerForSession(threadErrorBannerKey);

@@ -45,6 +45,7 @@ import {
 } from "../Errors.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import { type OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
+import { providerUsageLimitFromError } from "../usageLimits.ts";
 import {
   buildOpenCodePermissionRules,
   OpenCodeRuntime,
@@ -2622,6 +2623,10 @@ export function makeOpenCodeAdapter(
 
         case "session.error": {
           const message = sessionErrorMessage(event.properties.error);
+          const usageLimit = providerUsageLimitFromError({
+            message,
+            detail: event.properties.error,
+          });
           const activeTurnId = context.activeTurnId;
           const cancellation = context.cancellation;
           if (isOpenCodeAbortError(event.properties.error)) {
@@ -2685,7 +2690,8 @@ export function makeOpenCodeAdapter(
             type: "runtime.error",
             payload: {
               message,
-              class: "provider_error",
+              class: usageLimit === null ? "provider_error" : "usage_limit",
+              ...(usageLimit?.retryAt !== undefined ? { retryAt: usageLimit.retryAt } : {}),
               detail: event.properties.error,
             },
           });

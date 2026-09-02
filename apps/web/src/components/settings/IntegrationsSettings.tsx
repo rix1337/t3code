@@ -37,6 +37,7 @@ import { PREVIEW_VIEWPORT_PRESETS } from "@t3tools/shared/previewViewport";
 import { Link } from "@tanstack/react-router";
 import { MoreVertical, Plus as PlusIcon } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
+import { useAtomValue } from "@effect/atom-react";
 
 import { ScreenRotationIcon } from "~/browser/ScreenRotationIcon";
 import { resolveEnvironmentOptionLabel } from "~/components/BranchToolbar.logic";
@@ -84,10 +85,12 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
   getClientSettings,
   persistClientSettingsUpdate,
+  usePrimarySettings,
   useClientSettings,
   useClientSettingsHydrated,
   useUpdatePrimarySettings,
 } from "~/hooks/useSettings";
+import { primaryServerConfigAtom } from "~/state/server";
 
 import {
   SettingsUnavailableGroup,
@@ -1141,6 +1144,10 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
 }
 
 export function IntegrationsSettingsPanel() {
+  const settings = usePrimarySettings();
+  const updateSettings = useUpdatePrimarySettings();
+  const supportsUsageLimitResume =
+    useAtomValue(primaryServerConfigAtom)?.environment.capabilities.threadUsageLimitResume === true;
   // Client-local preview defaults are editable only where the preview exists.
   const previewDefaultsDisabled = !isElectron;
   const previewDefaults = (
@@ -1157,6 +1164,23 @@ export function IntegrationsSettingsPanel() {
 
   return (
     <SettingsPageContainer>
+      {supportsUsageLimitResume ? (
+        <SettingsSection id="automatic-resume" title="Automatic resume">
+          <SettingsRow
+            {...searchableSetting("automatic-resume")}
+            description="Automatically continue after provider limits or temporary outages. Turning this off cancels pending retries in this environment. Each retry sends a continuation prompt."
+            control={
+              <Switch
+                checked={settings.enableAutomaticResume}
+                onCheckedChange={(checked) =>
+                  updateSettings({ enableAutomaticResume: Boolean(checked) })
+                }
+                aria-label="Enable automatic resume"
+              />
+            }
+          />
+        </SettingsSection>
+      ) : null}
       <SettingsSection id="browser" title="Browser">
         {/* Server-authoritative, so it stays editable on any client anchored to
             a server; `serverScoped` covers the hosted app, which has none. It

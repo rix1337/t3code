@@ -48,6 +48,16 @@ const decide = (
   }) !== null;
 
 describe("resolveAutoSettlementAt", () => {
+  it.each(["2026-09-01T12:00:00.000Z", null])(
+    "keeps pending or in-flight resumes active past the inactivity threshold: %s",
+    (nextAttemptAt) => {
+      const thread = makeThread({ usageLimitResume: { nextAttemptAt, attempt: 8 } });
+      expect(decide(thread)).toBe(false);
+      expect(decide(thread, { state: "merged", mergedAt: NOW })).toBe(false);
+      expect(decide({ ...thread, usageLimitResume: null })).toBe(true);
+    },
+  );
+
   it("returns the last activity time for persisted settlement", () => {
     expect(
       resolveAutoSettlementAt({

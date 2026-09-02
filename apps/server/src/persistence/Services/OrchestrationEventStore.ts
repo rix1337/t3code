@@ -92,6 +92,7 @@ export interface OrchestrationEventStoreShape {
     readonly aggregateId: string;
     readonly type?: OrchestrationEvent["type"];
     readonly sequenceExclusive: number;
+    readonly afterLatestEvent?: OrchestrationEvent["type"];
   }) => Effect.Effect<boolean, OrchestrationEventStoreError>;
 }
 

@@ -108,6 +108,7 @@ export function applyThreadDetailEvent(
           activeOrderKey: null,
           snoozedUntil: null,
           snoozedAt: null,
+          usageLimitResume: null,
           deletedAt: null,
           messages: [],
           proposedPlans: [],
@@ -185,6 +186,50 @@ export function applyThreadDetailEvent(
           ...thread,
           snoozedUntil: null,
           snoozedAt: null,
+          updatedAt: event.payload.updatedAt,
+        },
+      };
+
+    case "thread.usage-limit-resume-scheduled":
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          usageLimitResume: {
+            nextAttemptAt: event.payload.resumeAt,
+            ...(event.payload.pendingMessageId !== undefined
+              ? { pendingMessageId: event.payload.pendingMessageId }
+              : {}),
+            attempt: event.payload.attempt,
+          },
+          updatedAt: event.payload.updatedAt,
+        },
+      };
+
+    case "thread.usage-limit-resume-attempted":
+      return event.payload.shouldResume
+        ? {
+            kind: "updated",
+            thread: {
+              ...thread,
+              usageLimitResume: {
+                nextAttemptAt: null,
+                ...(thread.usageLimitResume?.pendingMessageId !== undefined
+                  ? { pendingMessageId: thread.usageLimitResume.pendingMessageId }
+                  : {}),
+                attempt: event.payload.attempt,
+              },
+              updatedAt: event.payload.updatedAt,
+            },
+          }
+        : { kind: "unchanged" };
+
+    case "thread.usage-limit-resume-cancelled":
+      return {
+        kind: "updated",
+        thread: {
+          ...thread,
+          usageLimitResume: null,
           updatedAt: event.payload.updatedAt,
         },
       };

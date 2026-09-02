@@ -106,6 +106,14 @@ describe("custom model settings", () => {
   });
 });
 
+it("defaults automatic resume on and preserves a persisted opt-out", () => {
+  expect(decodeServerSettings({}).enableAutomaticResume).toBe(true);
+  expect(decodeServerSettings({ enableAutomaticResume: false }).enableAutomaticResume).toBe(false);
+  expect(decodeServerSettingsPatch({ enableAutomaticResume: false })).toEqual({
+    enableAutomaticResume: false,
+  });
+});
+
 describe("ClaudeSettings auto-compaction", () => {
   it("uses Claude's default threshold when no override is configured", () => {
     expect(decodeClaudeSettings({}).autoCompactWindow).toBe("");
